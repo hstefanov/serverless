@@ -53,7 +53,7 @@ def initApiGatewayIntegrationProxy(func_name, alias_name, region, account_no):
 	# Optimize later 
 	
 	for apiItem in gateways["items"]:
-		if apiItem["name"] == "mobile-api-dev":
+		if apiItem["name"] == "api":
 			restApiId = apiItem["id"]
 	
 	resources = client.get_resources(restApiId=restApiId)
