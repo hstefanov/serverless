@@ -1,0 +1,199 @@
+import time
+import boto3
+from datetime import datetime, date, timedelta
+import json
+import logging
+
+lambda_client = None
+apigateway_client = None
+
+
+def handler(event, context):
+    func_name = event['function-name']
+    region = event['region']
+    account_no = event['account_no']
+    version = event['new-version']
+    alias_name = event['alias-name']
+    steps = event['steps']
+    interval = event['interval']
+    weight_function = event.get('type', 'linear')
+    health_check = event.get('health-check', True)
+
+    init()
+    initLambdaAlias(func_name, alias_name)
+    initApiGatewayIntegrationProxy(func_name, alias_name, region, account_no)
+    weights = generate_weights(weight_function, steps)
+
+    for weight in weights:
+        update_weight(func_name, alias_name, version, weight)
+        sleep(interval)
+
+    if health_check:
+        success = do_health_check(func_name, alias_name, version)
+        if not success:
+            rollback(func_name, alias_name)
+            raise Exception('Health check failed, exiting')
+
+    res = finalize(func_name, alias_name, version)
+    return res
+
+
+def init():
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s'
+                        )
+    for logging_handler in logging.root.handlers:
+        logging_handler.addFilter(logging.Filter('simple'))
+
+def initApiGatewayIntegrationProxy(func_name, alias_name, region, account_no):
+	client = get_apigateway_client()
+	gateways = client.get_rest_apis()
+	restApiId = ""
+
+	# Optimize later 
+	
+	for apiItem in gateways["items"]:
+		if apiItem["name"] == "mobile-api-dev":
+			restApiId = apiItem["id"]
+	
+	resources = client.get_resources(restApiId=restApiId)
+
+	resourceId = ""
+	for item in resources["items"]:
+		if item["path"] == "/{proxy+}":
+			resourceId = item["id"]
+	
+	# put integration
+	response = client.put_integration(
+		restApiId=restApiId,
+		resourceId=resourceId,
+		httpMethod='ANY',
+		type='AWS_PROXY',
+		integrationHttpMethod='POST',
+		uri= f'arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:eu-west-1:{account_no}:function:{func_name}:{alias_name}/invocations',
+		passthroughBehavior='WHEN_NO_MATCH'
+	)
+
+def initLambdaAlias(func_name, alias_name):
+    client = get_lambda_client()
+    aliases = client.list_aliases(FunctionName=func_name)
+    print(aliases)
+    routing_config = {'AdditionalVersionWeights': {}}
+
+    hasAlias = False
+    for alias in aliases['Aliases']:
+        hasAlias = alias['Name'] == alias_name
+
+    if not hasAlias:
+        client.create_alias(FunctionName=func_name, Name=alias_name,
+                            FunctionVersion="1",
+                            RoutingConfig=routing_config)
+
+
+def generate_weights(type, steps):
+    if type == 'linear':
+        values = linear(steps)
+    else:
+
+    # implement other functions here
+
+        raise Exception('Invalid function type: ' + type)
+    return values
+
+
+def linear(num_points):
+    delta = 1.0 / num_points
+    prev = 0
+    values = []
+    for i in range(0, num_points):
+        val = prev + delta
+        values.append(round(val, 2))
+        prev = val
+    return values
+
+
+def update_weight(
+    func_name,
+    alias_name,
+    version,
+    next_weight,
+    ):
+
+    client = get_lambda_client()
+
+    weights = {version: next_weight}
+    routing_config = {'AdditionalVersionWeights': weights}
+
+    client.update_alias(FunctionName=func_name, Name=alias_name,
+                        RoutingConfig=routing_config)
+    return
+
+
+def get_lambda_client():
+    global lambda_client
+    if lambda_client is None:
+        lambda_client = boto3.client('lambda')
+    return lambda_client
+
+def get_apigateway_client():
+	global apigateway_client
+	if apigateway_client is None:
+		apigateway_client = boto3.client('apigateway')
+	return apigateway_client
+
+
+def sleep(sleep_time):
+    time.sleep(5)
+
+
+def do_health_check(func_name, alias_name, version):
+
+    # implement custom health checks here (i.e. invoke, cloudwatch alarms, etc)
+
+    return check_errors_in_cloudwatch(func_name, alias_name, version)
+
+
+def check_errors_in_cloudwatch(func_name, alias_name, new_version):
+    client = boto3.client('cloudwatch')
+
+    func_plus_alias = func_name + ':' + alias_name
+    now = datetime.utcnow()
+    start_time = now - timedelta(minutes=1)
+
+    response = client.get_metric_statistics(
+        Namespace='AWS/Lambda',
+        MetricName='Errors',
+        Dimensions=[{'Name': 'FunctionName', 'Value': func_name},
+                    {'Name': 'Resource', 'Value': func_plus_alias},
+                    {'Name': 'ExecutedVersion', 'Value': new_version}],
+        StartTime=start_time,
+        EndTime=now,
+        Period=60,
+        Statistics=['Sum'],
+        )
+    datapoints = response['Datapoints']
+    for datapoint in datapoints:
+        if datapoint['Sum'] > 0:
+            log.info('Failing health check because error metrics were found for new version: {0}'.format(datapoints))
+            return False
+
+    return True
+
+
+def rollback(func_name, alias_name):
+    log.info('Health check failed. Rolling back to original version')
+    client = get_lambda_client()
+    routing_config = {'AdditionalVersionWeights': {}}
+    client.update_alias(FunctionName=func_name, Name=alias_name,
+                        RoutingConfig=routing_config)
+    log.info('Alias was successfully rolled back to original version')
+    return
+
+
+def finalize(func_name, alias_name, version):
+    client = get_lambda_client()
+    routing_config = {'AdditionalVersionWeights': {}}
+    res = client.update_alias(FunctionName=func_name,
+                              FunctionVersion=version, Name=alias_name,
+                              RoutingConfig=routing_config)
+    return res
